@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+
+import argparse
+import logging
+
+import os
+import subprocess
+import stat
+from time import time
+
+from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
+import errno
+
+# TODOs
+# - option store the cache directory to a real directory and then reload
+# - getattr can generate Output objects that will never be cleared
+# - reduce the logging in the read function call
+# - revisit the file permisions
+
+UPDATE_INTERVAL_MIN = 0.5  # seconds
+UPDATE_INTERVAL_MAX = 3.5  # seconds
+
+ERROR_NOSUCH = errno.ENOENT
+ERROR_NOTPERMITTED = errno.EPERM
+ERROR_NODATA = errno.ENODATA
+ERROR_IO = errno.EIO
+
+log = logging.getLogger('execfs')
+
+
+def logit(target_func):
+    def wrapper_func(*args, **kwargs):
+        log.info(":: %s %s", target_func.__name__, args[1] if len(args) > 1 else "")
+        try:
+            return target_func(*args, **kwargs)
+        except FuseOSError as e:
+            log.info(" : %s + error: %s", target_func.__name__, e.strerror)
+            raise e
+    return wrapper_func
+
+
+class Output():
+
+    def __init__(self, command, caching=False, echo=False):
+        self.command = command
+        self.caching = caching
+        self.echo = echo
+        self.data = None
+        self.update = 0
+        self.attrs = self._newattrs(0)
+        self.opens = 0
+
+    def set(self, data):
+        self.data = data
+        self.attrs = self._newattrs(0 if data is None else len(data))
+
+    def get(self, consume=False):
+        if self.data is None or (not self.caching and time() >= self.update):
+            self._generate(self.command)
+        data = self.data
+        if consume and not self.caching:
+            self.data = None
+        return data
+
+    def exists(self):
+        return self.get() is not None
+
+    def check(self):
+        if not self.exists():
+            raise FuseOSError(ERROR_NOSUCH)
+        return self
+
+    def incOpens(self):
+        self.opens += 1
+
+    def decOpens(self):
+        'Returns True if this was the last open'
+        self.opens -= 1
+        # should never go bellow 0
+        return self.opens <= 0
+
+    @logit
+    def _generate(self, command):
+        if self.echo:
+            return self.set(command.encode('ascii') + b'\n')
+        # execute the command
+        start_time = time()
+        try:
+            result = subprocess.run(command, check=True, capture_output=True, shell=True)
+            self.set(result.stdout)
+            # next update should in at least the same ducation that this took to calculate
+            self.update = time() + min(time() - start_time + UPDATE_INTERVAL_MIN, UPDATE_INTERVAL_MAX)
+        except subprocess.CalledProcessError as result:
+            log.info(" stdout: %s", result.stdout)
+            log.info(" stderr: %s", result.stderr)
+            self.set(None)
+
+    def _newattrs(self, size):
+        now = time()
+        return dict(
+            st_mode=(stat.S_IFREG | 0o1777),
+            st_nlink=1,
+            st_size=size,
+            st_ctime=now,
+            st_mtime=now,
+            st_atime=now)
+
+
+class Execfs(Operations):
+
+    @logit
+    def __init__(self, args):
+        self.files = {}
+        self.outputs = {}
+        self.output_last = ('', None)
+        self.directory_cache = args.cache
+        self.unsafe = args.unsafe
+        self.echo = args.echo
+        now = time()
+        self.files['/'] = dict(
+            st_mode=(stat.S_IFDIR | 0o755),
+            st_ctime=now,
+            st_mtime=now,
+            st_atime=now,
+            st_nlink=2)
+        self.files["/{}".format(self.directory_cache)] = dict(
+            st_mode=(stat.S_IFDIR | 0o755),
+            st_ctime=now,
+            st_mtime=now,
+            st_atime=now,
+            st_nlink=2)
+        self.fd = 0
+
+    def create_output(self, path):
+        caching = "/{}/".format(self.directory_cache) in path
+        command = path[path.rindex('/')+1:]  # keep only filename
+        command = command.replace('\\', '/')  # decode escaped characters
+        output = Output(command, caching, self.echo)
+        return output
+
+    def fetch_output(self, path):
+        if path in self.outputs:
+            return self.outputs[path]
+        if path == self.output_last[0]:
+            output = self.output_last[1]
+        else:
+            output = self.create_output(path)
+            self.output_last = (path, output)
+        self.outputs[path] = output
+        return output
+
+    def fetch_attrs(self, path):
+        if path in self.files:
+            return self.files[path]
+        return self.fetch_output(path).check().attrs
+
+    @logit
+    def getattr(self, path, fh=None):
+        if path in self.files or self.unsafe:
+            return self.fetch_attrs(path)
+        else:
+            now = time()
+            # Create file attrs of an executable file with a size,
+            # with a non zero file size in order to suggests programs to open file and start reading.
+            return dict(
+                st_mode=(stat.S_IFREG | 0o1777),
+                st_nlink=1,
+                st_size=4*1024*1024,
+                st_ctime=now,
+                st_mtime=now,
+                st_atime=now)
+
+    @logit
+    def readdir(self, path, fh):
+        if not path[-1] == '/':
+            path += '/'
+
+        def is_child(fullpath):
+            return fullpath[:fullpath.rindex('/')+1] == path
+
+        def filename(fullpath):
+            return fullpath[fullpath.rindex('/')+1:]
+
+        return ['.', '..'] + [
+            filename(x) for x in self.files if x != '/' and is_child(x)
+        ] + [
+            filename(x) for x in self.outputs if self.outputs[x].exists() and is_child(x)
+        ]
+
+    @logit
+    def unlink(self, path):
+        if path in self.outputs:
+            self.outputs.pop(path)
+        elif path in self.files:
+            raise FuseOSError(ERROR_NOTPERMITTED)
+        else:
+            raise FuseOSError(ERROR_NOSUCH)
+
+    @logit
+    def open(self, path, flags):
+        self.fetch_output(path).check().incOpens()
+        self.fd += 1
+        return self.fd
+
+    @logit
+    def read(self, path, size, offset, fh):
+        data = self.fetch_output(path).get()
+        return data[offset:offset + size]
+
+    @logit
+    def truncate(self, path, length, fh=None):
+        data = self.fetch_output(path).get()
+        data = data[:length].ljust(length, '\x00'.encode('ascii'))
+        self.fetch_output(path).set(data)
+
+    @logit
+    def write(self, path, buffer, offset, fh):
+        data = self.fetch_output(path).get()
+        data = (
+            data[:offset].ljust(offset, '\x00'.encode('ascii'))
+            + buffer
+            + data[offset + len(buffer):])
+        self.fetch_output(path).set(data)
+        return len(buffer)
+
+    @logit
+    def release(self, path, fh):
+        output = self.fetch_output(path)
+        if not output.caching and output.decOpens():
+            self.outputs.pop(path)
+        return 0
+
+    @logit
+    def statfs(self, path):
+        size = sum(map(lambda i: len(i.data) if i.data is not None else 0, self.outputs.values()))
+        bsize = 1024*4
+        blocks = 1 + int(size/bsize)
+        return dict(f_bsize=bsize, f_frsize=bsize, f_blocks=blocks, f_bavail=0)
+
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('mountpoint', nargs='?', default='/tmp/execfs', help='filesystem root mount point (defaults to "/tmp/execfs")')
+    parser.add_argument('-b', '--background', action='store_true', help='start on the background')
+    parser.add_argument('-u', '--unsafe', action='store_true', help='allow possible indirect command executions')
+    parser.add_argument('-e', '--echo', action='store_true', help='echo commands instead of executing')
+
+    parser.add_argument('-c', '--cwd', dest='cwd', default=os.path.realpath('.'), help='set cwd (defaults to ".")')
+    parser.add_argument('--home', dest='cwd', action='store_const', const=os.path.expanduser('~'), help='set cwd to user home')
+    parser.add_argument('--cache', default='cached', help='set the name of cache directory (defaults to "cached")')
+
+    parser.add_argument('-l', '--logfile', default='/tmp/execfs.log')
+    parser.add_argument('-v', '--verbose', dest='loglevel', action='store_const', const=logging.INFO, default=logging.ERROR)
+    parser.add_argument('-q', '--quiet', dest='loglevel', action='store_const', const=logging.CRITICAL+1)
+    args = parser.parse_args()
+
+    if not os.path.exists(args.cwd):
+        os.makedirs(args.cwd)
+    os.chdir(args.cwd)
+
+    if not os.path.exists(args.mountpoint):
+        os.makedirs(args.mountpoint)
+
+    log.setLevel(logging.INFO)
+    log_formatter = logging.Formatter("%(asctime)s %(message)s", datefmt="%y%m%d.%H%M.%S")
+    log_handler = logging.StreamHandler()
+    log_handler.setFormatter(log_formatter)
+    log_handler.setLevel(args.loglevel)  # argument loglevel
+    log.addHandler(log_handler)
+    log_handler = logging.FileHandler(args.logfile)
+    log_handler.setFormatter(log_formatter)
+    log_handler.setLevel(logging.INFO)  # always info level
+    log.addHandler(log_handler)
+
+    fuse = FUSE(Execfs(args), args.mountpoint, fsname="execfs", foreground=(not args.background), **{'allow_other': True})

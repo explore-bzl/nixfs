@@ -1,0 +1,2 @@
+#!/bin/sh
+curl -s --unix-socket /var/run/docker.sock "http://./containers/json" | jq '.[] | select( .Names[0] | contains("nix_worker")) |"Host " + .NetworkSettings.Networks[].IPAddress + "\n\tHostName " + .Names[0][1:] + "\n\tPort " + "4022" + "\n\tIdentityFile /root/.ssh/id_rsa"' -r

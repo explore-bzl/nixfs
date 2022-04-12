@@ -1,0 +1,2 @@
+#!/bin/sh
+curl -s --unix-socket /var/run/docker.sock "http://./containers/json" | jq '.[] | select( .Names[0] | contains("nix_worker")) | .Names[0][1:] + " x86_64-linux /etc/nix/worker_rsa 4"' -r
