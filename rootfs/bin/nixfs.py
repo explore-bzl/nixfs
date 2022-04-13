@@ -6,7 +6,7 @@ import os
 import sys
 import errno
 
-from fuse import FUSE, FuseOSError, Operations
+from fusepy import FUSE, FuseOSError, Operations
 
 
 class Passthrough(Operations):
@@ -17,9 +17,14 @@ class Passthrough(Operations):
         if partial.startswith("/"):
             partial = partial[1:]
         path = os.path.join(self.root, partial)
-        if partial.startswith("nix/store/") and not os.path.exists(self.root + "/" + "/".join(partial.split("/")[0:3])):
-            print("Fetching: /" + partial)
-            os.system("nix copy --to " + self.root + " --from https://cache.nixos.org /" + partial + " --extra-experimental-features nix-command")
+
+        if not partial.startswith("store/"):
+            return path
+        
+        if os.path.exists(self.root + "/" + "/".join(partial.split("/")[0:3])):
+            return path
+        
+        os.system("su notnix -c 'NIX_IGNORE_SYMLINK_STORE=1 nix copy --to " + self.root+ " --from https://cache.nixos.org /nix/" + partial + " --extra-experimental-features nix-command'")
 
         return path
 
@@ -121,10 +126,8 @@ class Passthrough(Operations):
     def fsync(self, path, fdatasync, fh):
         return self.flush(path, fh)
 
-
 def main(mountpoint, root):
-    os.makedirs(os.path.join(root, "nix", "store"), exist_ok=True) 
-    FUSE(Passthrough(root), mountpoint, nothreads=True, foreground=True, **{'allow_other': True})
+    FUSE(Passthrough(root), mountpoint, nothreads=False, foreground=True, **{'allow_other': False, 'debug': False})
 
 if __name__ == '__main__':
     main(sys.argv[2], sys.argv[1])
