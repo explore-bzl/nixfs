@@ -8,7 +8,7 @@ from errno import EACCES
 from os.path import realpath
 from threading import Lock
 
-from fusepy import FUSE, FuseOSError, Operations, LoggingMixIn
+from fusepy import FUSE, FuseOSError, Operations, LoggingMixIn, fuse_get_context
 
 
 class Loopback(LoggingMixIn, Operations):
@@ -27,8 +27,13 @@ class Loopback(LoggingMixIn, Operations):
         if os.path.exists(self.root + "/" + "/".join(partial.split("/")[0:3])):
             return path
         
-        #print(fuse_get_context())
-        os.system("su notnix -c 'NIX_IGNORE_SYMLINK_STORE=1 nix copy --to " + self.root+ " --from https://cache.nixos.org /nix/" + partial + " --extra-experimental-features nix-command'")
+        uid, gid, pid = fuse_get_context()
+        with open('/proc/{}/comm'.format(pid), mode='rb') as fd:
+            content = fd.read().decode().split('\n')[0]
+            if content.startswith('nix'):
+                return path
+
+        os.system("unshare -m sh -c 'mount -n --bind /not_nix /nix; NIX_IGNORE_SYMLINK_STORE=1 nix copy --to " + self.root + " --from https://cache.nixos.org /nix/" + partial + " --extra-experimental-features nix-command'")
 
         return path
 
@@ -119,4 +124,4 @@ if __name__ == '__main__':
 
     logging.basicConfig(level=logging.INFO)
     fuse = FUSE(
-        Loopback(args.root), args.mount, foreground=True, allow_other=False)
+        Loopback(args.root), args.mount, foreground=True, allow_other=True)
