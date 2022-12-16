@@ -1,5 +1,6 @@
 # nixfs - lazy /nix/store based on FUSE
 
+![Demo](demo.gif)
 ## Quickstart
 1. Build image with:
 ```
