@@ -7,6 +7,7 @@ import os
 import subprocess
 from pathlib import Path
 from threading import Lock
+from functools import lru_cache
 
 from fusepy import FUSE, FuseOSError, Operations, LoggingMixIn, fuse_get_context
 
@@ -21,37 +22,52 @@ def setup_environment(root, mount):
     """
     Prepares the environment by creating directories and a symlink.
     """
-    os.makedirs(mount, exist_ok=True)
-    os.makedirs("/not_nix", exist_ok=True)
+    if not os.path.isdir(mount):
+        os.makedirs(mount)
+
+    if not os.path.isdir("/not_nix"):
+        os.makedirs("/not_nix")
+
     store_path = os.path.join(root, "store")
-    os.makedirs(store_path, exist_ok=True)
+    if not os.path.isdir(store_path):
+        os.makedirs(store_path)
+
     symlink_path = os.path.join(root, "nix")
-    if not os.path.exists(symlink_path):
-        os.symlink(root, symlink_path)
+    if not os.path.isfile(symlink_path):
+        os.symlink(root, symlink_path, target_is_directory=True)
 
 class Loopback(LoggingMixIn, Operations):
     """
     Implements a loopback filesystem using FUSE.
     """
     def __init__(self, root, nix_binary, cache_location):
-        self.root = Path(root).resolve()
+        self.root = os.path.realpath(root)
         self.nix_binary = nix_binary
         self.cache_location = cache_location
         self.rwlock = Lock()
+        self.path_cache = {}
 
+    @lru_cache(maxsize=128)
     def _full_path(self, partial):
         """
         Constructs the full path for a given partial path.
         """
         partial_path = Path(partial.lstrip("/"))
-        path = self.root / partial_path
+        path = os.path.join(self.root, partial_path)
 
         if (partial_path.parts and partial_path.parts[0] != "store") \
-                or path.exists():
+                or os.path.exists(path):
             return str(path)
 
+        if len(partial_path.parts) > 1:
+            cache_key = partial_path.parts[1]
+            if cache_key in self.path_cache:
+                cached_path = self.path_cache[cache_key]
+                relative_path = partial_path.relative_to(Path("store") / cache_key)
+                return str(cached_path / relative_path)
+
         uid, gid, pid = fuse_get_context()
-        with open(f"/proc/{pid}/comm", mode="rb") as fd:
+        with open(os.path.join("/proc", str(pid), "comm"), mode="rb") as fd:
             if fd.read().decode().startswith("nix"):
                 return str(path)
 
@@ -68,13 +84,17 @@ class Loopback(LoggingMixIn, Operations):
             subprocess.run(["mount", "-n", "--bind", "/not_nix", "/nix"],
                            check=True, text=True)
             subprocess.run([
-                self.nix_binary, "copy", "--to", str(self.root),
+                self.nix_binary, "copy", "--to", self.root,
                 "--from", self.cache_location,
-                f"/nix/{path.relative_to(self.root)}",
+                os.path.join("/nix", os.path.relpath(path, self.root)),
                 "--extra-experimental-features", "nix-command"
             ], check=True, text=True, env=env)
         except subprocess.CalledProcessError as e:
             print(f"Error executing command: {e}")
+
+        if len(partial_path.parts) > 1:
+            cache_key = partial_path.parts[1]
+            self.path_cache[cache_key] = self.root / Path("store") / cache_key
 
         return str(path)
 
