@@ -28,6 +28,9 @@ def setup_environment(root, mount):
     if not os.path.isdir("/not_nix"):
         os.makedirs("/not_nix")
 
+    if not os.path.isdir("/nix"):
+        os.makedirs("/nix")
+
     store_path = os.path.join(root, "store")
     if not os.path.isdir(store_path):
         os.makedirs(store_path)
@@ -59,17 +62,19 @@ class Loopback(LoggingMixIn, Operations):
                 or os.path.exists(path):
             return str(path)
 
+        # This silently fails if store is shared
+        # uid, gid, pid = fuse_get_context()
+        # with open(os.path.join("/proc", str(pid), "comm"), mode="rb") as fd:
+        #    if fd.read().decode().startswith("nix"):
+        #        print("hmm")
+        #        return str(path)
+
         if len(partial_path.parts) > 1:
             cache_key = partial_path.parts[1]
             if cache_key in self.path_cache:
                 cached_path = self.path_cache[cache_key]
                 relative_path = partial_path.relative_to(Path("store") / cache_key)
                 return str(cached_path / relative_path)
-
-        uid, gid, pid = fuse_get_context()
-        with open(os.path.join("/proc", str(pid), "comm"), mode="rb") as fd:
-            if fd.read().decode().startswith("nix"):
-                return str(path)
 
         # Create a new mount namespace
         result = libc.syscall(UNSHARE_SYSCALL_NUMBER, CLONE_NEWNS)
@@ -89,12 +94,10 @@ class Loopback(LoggingMixIn, Operations):
                 os.path.join("/nix", os.path.relpath(path, self.root)),
                 "--extra-experimental-features", "nix-command"
             ], check=True, text=True, env=env)
-        except subprocess.CalledProcessError as e:
-            print(f"Error executing command: {e}")
-
-        if len(partial_path.parts) > 1:
             cache_key = partial_path.parts[1]
             self.path_cache[cache_key] = self.root / Path("store") / cache_key
+        except subprocess.CalledProcessError as e:
+            print(f"Error executing command: {e}")
 
         return str(path)
 
@@ -186,7 +189,7 @@ if __name__ == "__main__":
         description="Loopback Filesystem with Nix Integration")
     parser.add_argument("--root-dir", default="/true_nix",
                         help="Root directory. Default: /true_nix")
-    parser.add_argument("--mount-point", default="/nix",
+    parser.add_argument("--mount-point", default="/root/nix",
                         help="Mount point. Default: /nix")
     parser.add_argument("--nix-binary", default="/bin/nix",
                         help="Nix binary path. Default: /bin/nix")

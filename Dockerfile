@@ -13,11 +13,8 @@ ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ADD https://hydra.nixos.org/build/254313966/download/1/nix /bin/nix
 RUN chmod +x /bin/nix
 
-COPY rootfs/bin/nixfs.py /bin/nixfs
-COPY rootfs/bin/init /bin/init
+COPY rootfs/bin/nixfs.py /bin/storefs
 
 ENV PYTHONPATH=/usr/local/lib/python3.10/site-packages
 
-ENTRYPOINT ["/bin/init"]
-
-CMD ["/bin/bash"]
+ENTRYPOINT ["/bin/storefs"]
