@@ -9,7 +9,7 @@ from pathlib import Path
 from threading import Lock
 from functools import lru_cache
 
-from fusepy import FUSE, FuseOSError, Operations, LoggingMixIn, fuse_get_context
+from fuse import FUSE, FuseOSError, Operations, LoggingMixIn, fuse_get_context
 
 # Constants for system calls and flags
 UNSHARE_SYSCALL_NUMBER = 272  # Syscall number for unshare (x86_64)

@@ -1,0 +1,6 @@
+#!/bin/sh
+# Run nixfs with required arguments
+/bin/nixfs
+
+# Execute the command provided as arguments to the container
+exec "$@"
