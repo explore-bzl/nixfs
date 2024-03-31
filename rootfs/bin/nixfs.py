@@ -5,111 +5,101 @@ import ctypes
 import logging
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Lock
-from functools import lru_cache
+from threading import RLock, Condition
 
-from fuse import FUSE, FuseOSError, Operations, LoggingMixIn, fuse_get_context
-
-# Constants for system calls and flags
-UNSHARE_SYSCALL_NUMBER = 272  # Syscall number for unshare (x86_64)
-CLONE_NEWNS = 0x00020000       # Flag for creating a new mount namespace
-
-# Load libc for system call access
-libc = ctypes.CDLL("libc.so.6", use_errno=True)
+from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 
 def setup_environment(root, mount):
     """
     Prepares the environment by creating directories and a symlink.
     """
-    if not os.path.isdir(mount):
-        os.makedirs(mount)
-
-    if not os.path.isdir("/not_nix"):
-        os.makedirs("/not_nix")
-
-    if not os.path.isdir("/nix"):
-        os.makedirs("/nix")
-
-    store_path = os.path.join(root, "store")
-    if not os.path.isdir(store_path):
-        os.makedirs(store_path)
-
+    os.makedirs(mount, exist_ok=True)
+    os.makedirs("/nix", exist_ok=True)
+    os.makedirs(os.path.join(root, "store"), exist_ok=True)
     symlink_path = os.path.join(root, "nix")
     if not os.path.isfile(symlink_path):
         os.symlink(root, symlink_path, target_is_directory=True)
 
+
 class Loopback(LoggingMixIn, Operations):
-    """
-    Implements a loopback filesystem using FUSE.
-    """
     def __init__(self, root, nix_binary, cache_location):
         self.root = os.path.realpath(root)
         self.nix_binary = nix_binary
         self.cache_location = cache_location
-        self.rwlock = Lock()
-        self.path_cache = {}
+        self.rwlock = RLock()
+        self.processed_paths = set()  # Cache for successfully processed paths
+        self.copy_condition = Condition(self.rwlock)
+        self.nix_copy_futures = {}
+        self.nix_executor = ThreadPoolExecutor(max_workers=10)
 
-    @lru_cache(maxsize=128)
     def _full_path(self, partial):
-        """
-        Constructs the full path for a given partial path.
-        """
         partial_path = Path(partial.lstrip("/"))
         path = os.path.join(self.root, partial_path)
 
-        if (partial_path.parts and partial_path.parts[0] != "store") \
-                or os.path.exists(path):
+        if len(partial_path.parts) <= 1 or partial_path.parts[0] != "store":
             return str(path)
 
-        # This silently fails if store is shared
-        # uid, gid, pid = fuse_get_context()
-        # with open(os.path.join("/proc", str(pid), "comm"), mode="rb") as fd:
-        #    if fd.read().decode().startswith("nix"):
-        #        print("hmm")
-        #        return str(path)
+        package_hash = partial_path.parts[1]
+        with self.rwlock:
+            if package_hash in self.processed_paths:
+                return str(path)
+            if package_hash not in self.nix_copy_futures:
+                # Submit new nix copy task
+                future = self.nix_executor.submit(
+                    self._run_nix_copy_group, package_hash
+                )
+                self.nix_copy_futures[package_hash] = future
+                future.add_done_callback(lambda f: self._mark_processed(package_hash))
+            else:
+                future = self.nix_copy_futures[package_hash]
 
-        if len(partial_path.parts) > 1:
-            cache_key = partial_path.parts[1]
-            if cache_key in self.path_cache:
-                cached_path = self.path_cache[cache_key]
-                relative_path = partial_path.relative_to(Path("store") / cache_key)
-                return str(cached_path / relative_path)
-
-        # Create a new mount namespace
-        result = libc.syscall(UNSHARE_SYSCALL_NUMBER, CLONE_NEWNS)
-        if result != 0:
-            errno = ctypes.get_errno()
-            raise OSError(errno, os.strerror(errno))
-
-        env = os.environ.copy()
-        env["NIX_IGNORE_SYMLINK_STORE"] = "1"
-
-        try:
-            subprocess.run(["mount", "-n", "--bind", "/not_nix", "/nix"],
-                           check=True, text=True)
-            subprocess.run([
-                self.nix_binary, "copy", "--to", self.root,
-                "--from", self.cache_location,
-                os.path.join("/nix", os.path.relpath(path, self.root)),
-                "--extra-experimental-features", "nix-command"
-            ], check=True, text=True, env=env)
-            cache_key = partial_path.parts[1]
-            self.path_cache[cache_key] = self.root / Path("store") / cache_key
-        except subprocess.CalledProcessError as e:
-            print(f"Error executing command: {e}")
+        # Wait for the nix copy operation to complete for store paths asynchronously
+        future.result().wait()
 
         return str(path)
 
-    # The rest of the methods implement the filesystem operations.
-    # These methods are mostly straightforward wrappers around the corresponding os module functions.
+    def _mark_processed(self, package_hash):
+        with self.rwlock:
+            self.processed_paths.add(package_hash)
+            del self.nix_copy_futures[package_hash]
+
+    def _run_nix_copy_group(self, package_hash):
+        nix_store_path = os.path.join("/nix/store", package_hash)
+        command = [
+            "unshare",
+            "-m",
+            "sh",
+            "-c",
+            " ".join(["mount", "-n", "--bind", "/proc/self/cwd", "/nix"])
+            + " ; "
+            + " ".join(
+                [
+                    self.nix_binary,
+                    "copy",
+                    "--to",
+                    self.root,
+                    "--from",
+                    self.cache_location,
+                    nix_store_path,
+                    "--extra-experimental-features",
+                    "nix-command",
+                ]
+            ),
+        ]
+        env = {"NIX_IGNORE_SYMLINK_STORE": "1"}
+
+        # Execute the subprocess in a non-blocking way
+        process = subprocess.Popen(command, env=env)
+        return process
 
     def __call__(self, op, path, *args):
         return super().__call__(op, self._full_path(path), *args)
 
     def access(self, path, mode):
         if not os.access(path, mode):
-            raise FuseOSError(EACCES)
+            raise FuseOSError(os.errno.EACCES)
 
     chmod = os.chmod
     chown = os.chown
@@ -117,15 +107,19 @@ class Loopback(LoggingMixIn, Operations):
 
     def getattr(self, path, fh=None):
         st = os.lstat(path)
-        return {key: getattr(st, key) for key in (
-            "st_atime",
-            "st_ctime",
-            "st_gid",
-            "st_mode",
-            "st_mtime",
-            "st_nlink",
-            "st_size",
-            "st_uid")}
+        return {
+            key: getattr(st, key)
+            for key in (
+                "st_atime",
+                "st_ctime",
+                "st_gid",
+                "st_mode",
+                "st_mtime",
+                "st_nlink",
+                "st_size",
+                "st_uid",
+            )
+        }
 
     def release(self, path, fh):
         return os.close(fh)
@@ -134,10 +128,7 @@ class Loopback(LoggingMixIn, Operations):
         return os.fsync(fh)
 
     def fsync(self, path, datasync, fh):
-        if datasync != 0:
-            return os.fdatasync(fh)
-        else:
-            return os.fsync(fh)
+        return os.fdatasync(fh) if datasync != 0 else os.fsync(fh)
 
     getxattr = None
     link = os.link
@@ -172,33 +163,49 @@ class Loopback(LoggingMixIn, Operations):
 
     def statfs(self, path):
         stv = os.statvfs(path)
-        return {key: getattr(stv, key) for key in (
-            "f_bavail",
-            "f_bfree",
-            "f_blocks",
-            "f_bsize",
-            "f_favail",
-            "f_ffree",
-            "f_files",
-            "f_flag",
-            "f_frsize",
-            "f_namemax")}
+        return {
+            key: getattr(stv, key)
+            for key in (
+                "f_bavail",
+                "f_bfree",
+                "f_blocks",
+                "f_bsize",
+                "f_favail",
+                "f_ffree",
+                "f_files",
+                "f_flag",
+                "f_frsize",
+                "f_namemax",
+            )
+        }
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Loopback Filesystem with Nix Integration")
-    parser.add_argument("--root-dir", default="/true_nix",
-                        help="Root directory. Default: /true_nix")
-    parser.add_argument("--mount-point", default="/root/nix",
-                        help="Mount point. Default: /nix")
-    parser.add_argument("--nix-binary", default="/bin/nix",
-                        help="Nix binary path. Default: /bin/nix")
-    parser.add_argument("--cache-location", default="https://cache.nixos.org",
-                        help="Nix cache URL. Default: https://cache.nixos.org")
+        description="Loopback Filesystem with Nix Integration"
+    )
+    parser.add_argument(
+        "--root-dir", default="/true_nix", help="Root directory. Default: /true_nix"
+    )
+    parser.add_argument(
+        "--mount-point", default="/root/nix", help="Mount point. Default: /nix"
+    )
+    parser.add_argument(
+        "--nix-binary", default="/bin/nix", help="Nix binary path. Default: /bin/nix"
+    )
+    parser.add_argument(
+        "--cache-location",
+        default="https://cache.nixos.org",
+        help="Nix cache URL. Default: https://cache.nixos.org",
+    )
     args = parser.parse_args()
 
     setup_environment(args.root_dir, args.mount_point)
 
     logging.basicConfig(level=logging.INFO)
-    fuse = FUSE(Loopback(args.root_dir, args.nix_binary, args.cache_location),
-                args.mount_point, foreground=True, allow_other=True)
+    fuse = FUSE(
+        Loopback(args.root_dir, args.nix_binary, args.cache_location),
+        args.mount_point,
+        foreground=True,
+        allow_other=True,
+    )
