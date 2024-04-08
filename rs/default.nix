@@ -17,15 +17,17 @@
   # TODO: This will be move downwards to each sub-module
   nixfs-rs-bin-cargo = builtins.fromTOML (builtins.readFile ./Cargo.toml);
   nixfs-rs-bin = rust.buildRustPackage {
-    pname = nixfs-rs-bin-cargo.package.name;    
+    pname = nixfs-rs-bin-cargo.package.name;
     inherit (nixfs-rs-bin-cargo.package) version;
 
-    src = nixpkgs.stdenv.mkDerivation {
-      name = "${nixfs-rs-bin-cargo.package.name}-src";
-      src = ./.;
-    };
+    # Approach below, breaks the cargoLock lockFile
+    # src = nixpkgs.stdenv.mkDerivation {
+    #   name = "${nixfs-rs-bin-cargo.package.name}-src";
+    #   src = ./.;
+    # };
+    src = ./.;
 
-    cargoLock = {lockFile = ./Cargo.lock;};
+    cargoLock = {lockFile = "./Cargo.lock";};
   };
 in {
   inherit devShell nixpkgs nixfs-rs-bin;
