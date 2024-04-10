@@ -2,10 +2,13 @@
   mkShell,
   alejandra,
   cocogitto,
+  fuse3,
   git,
   helix,
   niv,
+  pkg-config,
   rust,
+  rust-analyzer,
   statix,
 }:
 mkShell {
@@ -17,6 +20,10 @@ mkShell {
     helix
     niv
     rust.rustBin
+    rust-analyzer
     statix
+    # crate: fuser deps
+    fuse3
+    pkg-config
   ];
 }

@@ -20,6 +20,15 @@
     pname = nixfs-rs-bin-cargo.package.name;
     inherit (nixfs-rs-bin-cargo.package) version;
 
+    nativeBuildInputs = [
+      nixpkgs.fuse3
+      nixpkgs.pkg-config
+    ];
+    buildInputs = [
+      nixpkgs.fuse3
+      nixpkgs.pkg-config
+    ];
+
     # Approach below, breaks the cargoLock lockFile
     # src = nixpkgs.stdenv.mkDerivation {
     #   name = "${nixfs-rs-bin-cargo.package.name}-src";
@@ -27,7 +36,7 @@
     # };
     src = ./.;
 
-    cargoLock = {lockFile = "./Cargo.lock";};
+    cargoLock = {lockFile = ./Cargo.lock;};
   };
 in {
   inherit devShell nixpkgs nixfs-rs-bin;
