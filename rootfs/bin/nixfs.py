@@ -1,3 +1,5 @@
+#!/usr/local/bin/python
+
 import argparse, contextlib, email.parser, email.policy, errno, logging, os, os.path, struct, sys, tempfile
 from functools import lru_cache
 from pathlib import Path

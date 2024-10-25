@@ -6,9 +6,11 @@ FROM scratch
 ENV EMPTY=1
 EOF
 
+mkdir -p $(pwd)/tmp
+
 docker run --name nixfs --rm --cap-add SYS_ADMIN -v $(pwd)/rootfs/bin/nixfs.py:/bin/storefs --device /dev/fuse -v $(pwd)/tmp:/root/nix:shared localhost/nixfs:latest &
 
 sleep 5
-docker run -v $(pwd)/tmp:/nix -it empty /nix/store/rnxji3jf6fb0nx2v0svdqpj9ml53gyqh-hello-2.12.1/bin/hello
+docker run -v $(pwd)/tmp:/nix -it localhost/empty:latest /nix/store/2idc2ipafc7dwpr7q4cq77y4k9z93x1k-cowsay-3.7.0/bin/cowsay "Hello NixCon24!"
 
-docker kill nixfs
+docker stop nixfs
